@@ -1,0 +1,6 @@
+playfabsharedsettings
+playfabauthenticatorsettings
+PhotonAuthenticatorSettings
+PhotonAppSettings
+PhotonServerSettings
+MothershipSharedSettings
