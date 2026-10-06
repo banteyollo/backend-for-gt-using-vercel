@@ -71,7 +71,7 @@ so deselect everything except mono behaviour and search the stuff and edit with 
 
 also a bug in UABEA if u search any of these and it says it doesn't exist save and reopen UABEA and use filters and search again should be fine
 
-ok so now if u did it correctly you should have a working backend but idk why private servers dont work so just build the mod named Plugin.cs
+ok so now if u did it correctly you should have a working backend so private rooms work also names too
 
 also the backend is coded by ai glm5.3 flash i made it cuz i have a mod that gives me every ednpoint the game uses and its response it helped
 
