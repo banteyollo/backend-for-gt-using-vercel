@@ -21,6 +21,8 @@
 #   Supabase), so device-key auth replaces real Steam/PlayFab auth on purpose.
 #   No Steam ticket validation exists anywhere by design.
 #
+# SECRETS: supply SUPABASE_URL / SUPABASE_KEY / PLAYFAB_* via Vercel env vars.
+# Never commit real keys here.
 # ============================================================================
 
 import os
@@ -53,15 +55,15 @@ except Exception:  # pragma: no cover
 
 CONFIG = {
     # Supabase (service-role key - keep in env vars in production)
-    "supabase_url": os.environ.get("SUPABASE_URL", "ur supabase"),
+    "supabase_url": os.environ.get("SUPABASE_URL", "ursupabase.supabase.co"),
     "supabase_key": os.environ.get(
         "SUPABASE_KEY",
         "ur supabase key"),
 
     # PlayFab (cosmetics inventory / DLC catalog / display names)
-    "playfab_title_id": os.environ.get("PLAYFAB_TITLE_ID", "ur plafyab title id"),
+    "playfab_title_id": os.environ.get("PLAYFAB_TITLE_ID", "ur title id"),
     "playfab_secret_key": os.environ.get(
-        "PLAYFAB_SECRET_KEY", "ur playfab secret key"),
+        "PLAYFAB_SECRET_KEY", "playfab secret key"),
 
     # Mothership identifiers - these are baked into the ES256 player tokens.
     # The client echoes them back in every request body (MothershipEnvId /
@@ -573,7 +575,6 @@ TITLE_DATA_FILES = {
     'HEATWAVE': 'HEATWAVE TITLE DATA.json',
     'Summer23': 'Summer23 TITLE DATA.json',
     'Science24': 'SCIENCE24 TITLE DATA.json',
-    'Halloween26Pt1': 'HALLOWEEN 26 PT1 TITLE DATA.json',
 }
 
 # Keys the client expects as parsed JSON objects rather than strings
@@ -685,7 +686,7 @@ def playfab_grant_items_to_user(playfabid, item_ids, catalog_version='DLC'):
     })
 
 def playfab_update_display_name(playfabid, display_name):
-    return playfab_request('POST', '/Server/UpdateUserTitleDisplayName', {
+    return playfab_request('POST', '/Admin/UpdateUserTitleDisplayName', {
         'PlayFabId': playfabid,
         'DisplayName': display_name,
     })
@@ -952,6 +953,14 @@ SI_QUEST_DEFINITIONS_FALLBACK = [
     _si_quest(34, 'PLAY 5 ROUNDS', 'gameModeRound', 'SUPER INFEC', 5, category='GameRound'),
 ]
 
+# Official fresh-day claim quotas. Captured on the official server
+# 2026-10-03 09:12: {"todayClaimableQuests":9,"todayClaimableBonus":3,
+# "todayClaimableIdol":1}, decrementing 9 -> 8 -> 7 with every
+# SetSIQuestComplete. The client shows these as the day's claimable rewards.
+SI_DAILY_CLAIMABLE_QUESTS = 9
+SI_DAILY_CLAIMABLE_BONUS = 3
+
+
 def si_ensure_player_exists(mothershipid):
     """Ensure the player has SI resource + quest-status rows. Accepts the
     legacy 2-arg call style (playfabid, mothershipid) silently."""
@@ -966,8 +975,8 @@ def si_ensure_player_exists(mothershipid):
     if not db_get_one('si_player_quest_status', {'mothershipid': mothershipid}, 'mothershipid'):
         db_insert('si_player_quest_status', {
             'mothershipid': mothershipid,
-            'stashed_quests': 3,
-            'stashed_bonus_points': 1,
+            'stashed_quests': SI_DAILY_CLAIMABLE_QUESTS,
+            'stashed_bonus_points': SI_DAILY_CLAIMABLE_BONUS,
             'bonus_progress': 0,
             'daily_limited_turned_in': False,
         })
@@ -1002,14 +1011,16 @@ def si_get_quest_status(mothershipid):
         si_ensure_player_exists(mothershipid)
         row = db_get_one('si_player_quest_status', {'mothershipid': mothershipid})
     return row or {
-        'stashed_quests': 3, 'stashed_bonus_points': 1, 'bonus_progress': 0,
+        'stashed_quests': SI_DAILY_CLAIMABLE_QUESTS,
+        'stashed_bonus_points': SI_DAILY_CLAIMABLE_BONUS,
+        'bonus_progress': 0,
         'daily_limited_turned_in': False, 'last_reset_date': None,
     }
 
 def si_roll_daily_reset(mothershipid):
     """Grant a new UTC day's claimables (capped at the official fresh-day
-    amounts: quests<=3, bonus<=1, idol re-armed). Leftovers do NOT accumulate
-    beyond the official caps."""
+    amounts: quests<=9, bonus<=3, idol re-armed). Leftovers do NOT accumulate
+    beyond the official caps, so a stale row self-heals on the next day."""
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     status = si_get_quest_status(mothershipid)
     last_reset = str(status.get('last_reset_date') or '')[:10]
@@ -1018,8 +1029,12 @@ def si_roll_daily_reset(mothershipid):
         return status
 
     fresh = {
-        'stashed_quests': min(3, max(0, int(status.get('stashed_quests', 0) or 0)) + 3),
-        'stashed_bonus_points': min(1, max(0, int(status.get('stashed_bonus_points', 0) or 0)) + 1),
+        'stashed_quests': min(SI_DAILY_CLAIMABLE_QUESTS,
+                              max(0, int(status.get('stashed_quests', 0) or 0))
+                              + SI_DAILY_CLAIMABLE_QUESTS),
+        'stashed_bonus_points': min(SI_DAILY_CLAIMABLE_BONUS,
+                                    max(0, int(status.get('stashed_bonus_points', 0) or 0))
+                                    + SI_DAILY_CLAIMABLE_BONUS),
         'bonus_progress': 0,
         'daily_limited_turned_in': False,
         'last_reset_date': today,
@@ -1805,153 +1820,211 @@ def api_set_shared_group_data():
         return jsonify(_pf_ok({'SetData': False}))
 
 # ============================================================================
-# Routes - CloudScript (ExecuteFunction dispatcher + per-function endpoints)
+# Routes - /api/* endpoints (explicit @app.route, no CloudScript dispatcher)
+# NOTE: /api/CheckForBadName and /api/GetAcceptedAgreements are defined
+#       elsewhere in this file. Not duplicated here.
 # ============================================================================
 
-def _cs_success(function_result, function_name='Function'):
-    return jsonify({
-        'code': 200, 'status': 'OK',
-        'data': {
-            'ExecutionTimeMilliseconds': 1,
-            'FunctionName': function_name,
-            'FunctionResult': function_result,
-            'FunctionResultSize': len(json.dumps(function_result or {})),
-            'Logs': [],
-        },
-    })
+# ---- helpers ----------------------------------------------------------------
 
-def _cs_error(message, error_code=5):
-    return jsonify({
-        'code': 400, 'status': 'BadRequest',
-        'error': 'CloudScriptFunctionArgumentError',
-        'errorCode': error_code,
-        'errorMessage': message,
-    }), 400
+def _plain_params():
+    """Pull FunctionParameter / FunctionArgument out of the request body.
 
-# ---- individual CloudScript functions --------------------------------
+    Handles:
+      - {"FunctionParameter": {...}} / {"FunctionArgument": {...}}
+      - {"FunctionParameter": "{...json...}"} (string-encoded)
+      - raw dict body
+      - raw string body
+      - empty body -> {}
+    """
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    params = None
+    if isinstance(body, dict):
+        params = body.get('FunctionParameter')
+        if params is None:
+            params = body.get('FunctionArgument')
+        if params is None:
+            params = body
+    elif isinstance(body, str):
+        params = body
 
-def cs_get_accepted_agreements(params, playfabid):
-    accepted = {}
-    if playfabid:
-        for row in db_get('acceptedagreements', {'playfabid': playfabid}):
-            accepted[row.get('agreementkey')] = row.get('version', '')
-    requested = []
     if isinstance(params, str) and params:
-        requested = [k.strip() for k in params.split(',') if k.strip()]
-    elif isinstance(params, dict):
-        requested = params.get('keys') or list(params.keys())
+        parsed = safe_json_loads(params)
+        if parsed is not None:
+            params = parsed
+    return params
 
-    versions = {
-        'TOS': CONFIG['agreement_version'],
-        'PrivacyPolicy': CONFIG['agreement_version'],
-    }
-    if requested:
-        versions = {k: versions.get(k, '') for k in requested}
-    return versions
 
-def cs_submit_accepted_agreements(params, playfabid):
-    if playfabid and isinstance(params, dict):
-        for key, version in params.items():
-            db_upsert('acceptedagreements', {
-                'playfabid': playfabid,
-                'agreementkey': key,
-                'version': str(version),
-                'acceptedat': utc_now_iso(),
-            }, ['playfabid', 'agreementkey'])
-    return 'Agreements submitted successfully'
-
-def cs_return_current_version(params, playfabid):
-    return {'version': CONFIG['game_version'], 'supported': True}
-
-def cs_try_distribute_currency(params, playfabid):
-    if playfabid:
-        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        player = db_get_one('players', {'playfabid': playfabid})
-        if player and player.get('last_daily') == today:
-            return {'success': True}
-        if CONFIG['playfab_secret_key']:
-            playfab_grant_items_to_user(playfabid, ['SR_100'])
-        db_update('players', {'playfabid': playfabid}, {'last_daily': today})
-    return {'success': True}
-
-def cs_add_or_remove_dlc_ownership(params, playfabid):
-    return {'success': True}
-
-def cs_broadcast_my_room(params, playfabid):
-    key_to_follow = params.get('KeyToFollow', '') if isinstance(params, dict) else ''
-    room_to_join = params.get('RoomToJoin', '') if isinstance(params, dict) else ''
-    if key_to_follow and room_to_join:
-        db_upsert('sharedgroupdata', {
-            'groupid': key_to_follow,
-            'datakey': 'RoomToJoin',
-            'value': room_to_join,
-            'updatedat': utc_now_iso(),
-        }, ['groupid', 'datakey'])
-    return {'success': True}
-
-def cs_update_personal_cosmetics_list(params, playfabid):
-    if playfabid and CONFIG['playfab_secret_key']:
-        inv = playfab_get_user_inventory(playfabid)
-        items = (inv.get('data', {}).get('data', {}).get('Inventory')) or []
-        if items:
-            item_ids = [item['ItemId'] for item in items]
-            inv_dict = {
-                item['ItemId']: {
-                    'ItemId': item['ItemId'],
-                    'PurchaseDate': item.get('PurchaseDate', utc_now_iso()),
-                    'Annotation': None,
-                } for item in items
-            }
-            db_upsert('mothershipuserdata', {
-                'mothershipid': playfabid,
-                'keyname': f'{playfabid}Inventory',
-                'datavalue': json.dumps({'items': item_ids, 'dict': inv_dict}),
-                'updatedat': utc_now_iso(),
-            }, ['mothershipid', 'keyname'])
-    return {'success': True}
-
-def cs_return_queue_stats(params, playfabid):
-    queue_name = params.get('QueueName', '') if isinstance(params, dict) else str(params or '')
-    return {
-        'queueName': queue_name,
-        'playerCount': 0,
-        'estimatedWaitTime': 0,
-        'result': 0,
-    }
-
-def cs_return_vstump_map_stats(params, playfabid):
-    return {'success': True, 'result': 0}
-
-def cs_should_user_automute_player(params, playfabid):
-    return False
-
-def cs_check_for_bad_name(params, playfabid):
-    if isinstance(params, dict):
-        name = str(params.get('name', ''))
-        for_room = str(params.get('forRoom', 'False')).lower() == 'true'
-        for_troop = str(params.get('forTroop', 'False')).lower() == 'true'
-    else:
-        name = str(params or '')
-        for_room = for_troop = False
-
-    result, _reason = name_check_result(name)
-
-    if result == 0 and not for_room and not for_troop and playfabid and name:
-        db_upsert('players', {'playfabid': playfabid, 'displayname': name}, 'playfabid')
-        if CONFIG['playfab_secret_key']:
+def _plain_playfabid(body=None):
+    """Get playfabid from the request body (or query)."""
+    if body is None:
+        body = request.get_json(silent=True) or {}
+    pid = ''
+    if isinstance(body, dict):
+        pid = body.get('PlayFabId') or body.get('playfabid') or ''
+        if not pid:
+            st = body.get('SessionTicket') or ''
             try:
-                playfab_update_display_name(playfabid, name)
+                pid = playfab_pfid_from_session_ticket(st) or ''
             except Exception:
-                pass
-    return {'result': result}
+                pid = ''
+    if not pid:
+        pid = request.args.get('PlayFabId') or request.args.get('playfabid') or ''
+    return pid
 
-def cs_get_random_name(params, playfabid):
-    prefixes = ['Happy', 'Running', 'Laughing', 'Smiling', 'Cool', 'Bald']
-    suffixes = ['Cat', 'Dog', 'Hippo', 'Bird', 'Gorilla', 'Chicken', 'Sloth']
-    return f"{secrets.choice(prefixes)}{secrets.choice(suffixes)}"
 
-def cs_gorillanalytics(params, playfabid):
+# ---- endpoints --------------------------------------------------------------
+
+@app.route('/api/SubmitAcceptedAgreements', methods=['GET', 'POST'])
+def api_submit_accepted_agreements():
     try:
+        params = _plain_params()
+        playfabid = _plain_playfabid()
+        if playfabid and isinstance(params, dict):
+            for key, version in params.items():
+                db_upsert('acceptedagreements', {
+                    'playfabid': playfabid,
+                    'agreementkey': key,
+                    'version': str(version),
+                    'acceptedat': utc_now_iso(),
+                }, ['playfabid', 'agreementkey'])
+        return jsonify('Agreements submitted successfully')
+    except Exception as e:
+        print(f"[SubmitAcceptedAgreements error] {e}")
+        return jsonify('Agreements submitted successfully')
+
+
+@app.route('/api/ReturnCurrentVersionV2', methods=['GET', 'POST'])
+def api_return_current_version():
+    try:
+        return jsonify({'version': CONFIG['game_version'], 'supported': True})
+    except Exception as e:
+        print(f"[ReturnCurrentVersionV2 error] {e}")
+        return jsonify({'version': CONFIG['game_version'], 'supported': True})
+
+
+@app.route('/api/TryDistributeCurrencyV2', methods=['GET', 'POST'])
+def api_try_distribute_currency():
+    try:
+        playfabid = _plain_playfabid()
+        if playfabid:
+            today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            player = db_get_one('players', {'playfabid': playfabid})
+            if player and player.get('last_daily') == today:
+                return jsonify({'success': True})
+            if CONFIG['playfab_secret_key']:
+                playfab_grant_items_to_user(playfabid, ['SR_100'])
+            db_update('players', {'playfabid': playfabid}, {'last_daily': today})
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[TryDistributeCurrencyV2 error] {e}")
+        return jsonify({'success': True})
+
+
+@app.route('/api/AddOrRemoveDLCOwnershipV2', methods=['GET', 'POST'])
+def api_add_or_remove_dlc_ownership():
+    return jsonify({'success': True})
+
+
+@app.route('/api/BroadcastMyRoomV2', methods=['GET', 'POST'])
+def api_broadcast_my_room():
+    try:
+        params = _plain_params()
+        key_to_follow = params.get('KeyToFollow', '') if isinstance(params, dict) else ''
+        room_to_join = params.get('RoomToJoin', '') if isinstance(params, dict) else ''
+        if key_to_follow and room_to_join:
+            db_upsert('sharedgroupdata', {
+                'groupid': key_to_follow,
+                'datakey': 'RoomToJoin',
+                'value': room_to_join,
+                'updatedat': utc_now_iso(),
+            }, ['groupid', 'datakey'])
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[BroadcastMyRoomV2 error] {e}")
+        return jsonify({'success': True})
+
+
+@app.route('/api/UpdatePersonalCosmeticsList', methods=['GET', 'POST'])
+def api_update_personal_cosmetics_list():
+    try:
+        playfabid = _plain_playfabid()
+        if playfabid and CONFIG['playfab_secret_key']:
+            inv = playfab_get_user_inventory(playfabid)
+            items = (inv.get('data', {}).get('data', {}).get('Inventory')) or []
+            if items:
+                item_ids = [item['ItemId'] for item in items]
+                inv_dict = {
+                    item['ItemId']: {
+                        'ItemId': item['ItemId'],
+                        'PurchaseDate': item.get('PurchaseDate', utc_now_iso()),
+                        'Annotation': None,
+                    } for item in items
+                }
+                db_upsert('mothershipuserdata', {
+                    'mothershipid': playfabid,
+                    'keyname': f'{playfabid}Inventory',
+                    'datavalue': json.dumps({'items': item_ids, 'dict': inv_dict}),
+                    'updatedat': utc_now_iso(),
+                }, ['mothershipid', 'keyname'])
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"[UpdatePersonalCosmeticsList error] {e}")
+        return jsonify({'success': True})
+
+
+@app.route('/api/ReturnQueueStats', methods=['GET', 'POST'])
+def api_return_queue_stats():
+    try:
+        params = _plain_params()
+        queue_name = params.get('QueueName', '') if isinstance(params, dict) else str(params or '')
+        result = {
+            'queueName': queue_name,
+            'playerCount': 0,
+            'estimatedWaitTime': 0,
+            'result': 0,
+        }
+        return jsonify({'success': True, 'count': result['playerCount'], **result})
+    except Exception as e:
+        print(f"[ReturnQueueStats error] {e}")
+        return jsonify({'success': True, 'count': 0, 'queueName': '',
+                        'playerCount': 0, 'estimatedWaitTime': 0, 'result': 0})
+
+
+@app.route('/api/ReturnVstumpMapStats', methods=['GET', 'POST'])
+def api_return_vstump_map_stats():
+    return jsonify({'success': True, 'result': 0})
+
+
+@app.route('/api/ShouldUserAutomutePlayer', methods=['GET', 'POST'])
+def api_should_user_automute_player():
+    try:
+        return jsonify({'result': False, 'shouldMute': False, 'success': True})
+    except Exception as e:
+        print(f"[ShouldUserAutomutePlayer error] {e}")
+        return jsonify({'result': False, 'shouldMute': False, 'success': True})
+
+
+@app.route('/api/GetRandomName', methods=['GET', 'POST'])
+def api_get_random_name():
+    try:
+        prefixes = ['Happy', 'Running', 'Laughing', 'Smiling', 'Cool', 'Bald']
+        suffixes = ['Cat', 'Dog', 'Hippo', 'Bird', 'Gorilla', 'Chicken', 'Sloth']
+        result = f"{secrets.choice(prefixes)}{secrets.choice(suffixes)}"
+        return jsonify({'name': result, 'result': result})
+    except Exception as e:
+        print(f"[GetRandomName error] {e}")
+        return jsonify({'name': '', 'result': ''})
+
+
+@app.route('/api/Gorillanalytics', methods=['GET', 'POST'])
+def api_gorillanalytics():
+    try:
+        body = request.get_json(silent=True) or {}
+        params = _plain_params()
+        playfabid = _plain_playfabid(body)
         sessions = params.get('data', {}).get('sessions', []) if isinstance(params, dict) else []
         users = params.get('data', {}).get('users', []) if isinstance(params, dict) else []
         if sessions or users:
@@ -1963,96 +2036,15 @@ def cs_gorillanalytics(params, playfabid):
                 'sessions_json': json.dumps(sessions),
                 'users_json': json.dumps(users),
             })
+        return jsonify({'success': True})
     except Exception as e:
-        print(f"[analytics store error] {e}")
-    return {'success': True}
-
-def cs_unlock_competitive_queue(params, playfabid):
-    return {'success': True, 'unlocked': True}
-
-CLOUDSCRIPT_FUNCTIONS = {
-    'GetAcceptedAgreements': cs_get_accepted_agreements,
-    'SubmitAcceptedAgreements': cs_submit_accepted_agreements,
-    'ReturnCurrentVersionV2': cs_return_current_version,
-    'TryDistributeCurrencyV2': cs_try_distribute_currency,
-    'AddOrRemoveDLCOwnershipV2': cs_add_or_remove_dlc_ownership,
-    'BroadcastMyRoomV2': cs_broadcast_my_room,
-    'UpdatePersonalCosmeticsList': cs_update_personal_cosmetics_list,
-    'ReturnQueueStats': cs_return_queue_stats,
-    'ReturnVstumpMapStats': cs_return_vstump_map_stats,
-    'ShouldUserAutomutePlayer': cs_should_user_automute_player,
-    'CheckForBadName': cs_check_for_bad_name,
-    'GetRandomName': cs_get_random_name,
-    'Gorillanalytics': cs_gorillanalytics,
-    'UnlockCompetitiveQueue': cs_unlock_competitive_queue,
-}
+        print(f"[Gorillanalytics error] {e}")
+        return jsonify({'success': True})
 
 
-@app.route('/CloudScript/ExecuteFunction', methods=['GET', 'POST'])
-def cloudscript_execute_function():
-    """Unified dispatcher for every CloudScript function the client calls."""
-    try:
-        body = request.get_json(silent=True) or {}
-        function_name = body.get('FunctionName', '')
-        params = body.get('FunctionParameter')
-        if params is None:
-            params = body.get('FunctionArgument', {})
-        if isinstance(params, str) and params:
-            parsed = safe_json_loads(params)
-            params = parsed if parsed is not None else params
-        handler = CLOUDSCRIPT_FUNCTIONS.get(function_name)
-        if not handler:
-            return _cs_error(f"Unknown function: {function_name}")
-        playfabid = get_playfabid_from_request(body)
-        return _cs_success(handler(params, playfabid), function_name)
-    except Exception as e:
-        print(f"[ExecuteFunction error] {e}")
-        return _cs_error(str(e))
-
-
-def _cloudscript_route(function_name, prefix):
-    """Shared handler for /CloudScript/<FunctionName> and /api/<FunctionName>."""
-    def handler():
-        try:
-            body = request.get_json(silent=True) or {}
-            params = body.get('FunctionParameter')
-            if params is None:
-                params = body.get('FunctionArgument', {})
-            if isinstance(params, str) and params:
-                parsed = safe_json_loads(params)
-                params = parsed if parsed is not None else params
-            playfabid = get_playfabid_from_request(body)
-            result = CLOUDSCRIPT_FUNCTIONS[function_name](params, playfabid)
-        except Exception as e:
-            print(f"[{function_name} error] {e}")
-            result = False if function_name == 'ShouldUserAutomutePlayer' else \
-                ({'result': 0} if function_name == 'CheckForBadName' else {})
-
-        if prefix == 'api':
-            # LEGACY PLAIN SHAPE: the /api/* mirrors return the raw function
-            # result (old backend behavior - the modded client reads these
-            # bare, e.g. CheckForBadName -> {"result": 0}).
-            if function_name == 'GetRandomName' and isinstance(result, str):
-                return jsonify({'name': result, 'result': result})
-            if function_name == 'ReturnQueueStats' and isinstance(result, dict):
-                return jsonify({'success': True, 'count': result.get('playerCount', 0),
-                                **result})
-            if function_name == 'GetAcceptedAgreements' and isinstance(result, dict):
-                return jsonify(result)
-            if isinstance(result, bool):
-                return jsonify({'result': result, 'shouldMute': result,
-                                'success': True})
-            return jsonify(result)
-        return _cs_success(result, function_name)
-    handler.__name__ = f'{prefix}_{function_name}'
-    return handler
-
-
-for _fn in CLOUDSCRIPT_FUNCTIONS:
-    app.add_url_rule(f'/CloudScript/{_fn}', view_func=_cloudscript_route(_fn, 'cs'),
-                     methods=['GET', 'POST'])
-    app.add_url_rule(f'/api/{_fn}', view_func=_cloudscript_route(_fn, 'api'),
-                     methods=['GET', 'POST'])
+@app.route('/api/UnlockCompetitiveQueue', methods=['GET', 'POST'])
+def api_unlock_competitive_queue():
+    return jsonify({'success': True, 'unlocked': True})
 
 # ----------------------------------------------------------------------------
 # GetAcceptedAgreements legacy plain-shape route (the game also calls it bare)
@@ -2073,6 +2065,109 @@ def api_get_accepted_agreements():
     except Exception:
         return jsonify({'TOS': CONFIG['agreement_version'],
                         'PrivacyPolicy': CONFIG['agreement_version']})
+
+# ----------------------------------------------------------------------------
+# CheckForBadName endpit used if cloudscript is bugged or game needs smth else
+# ----------------------------------------------------------------------------
+
+def _extract_bad_name_params():
+    """Pull name / forRoom / forTroop / playfabid out of the request.
+
+    Handles:
+      - JSON dict body: {"name": "...", "forRoom": true, "forTroop": false}
+      - PlayFab-wrapped: {"FunctionParameter": {...}} / {"FunctionArgument": {...}}
+      - PlayFab envelope: {"Entity": {"Id": "..."}} /
+        {"CallerEntityProfile": {"Lineage": {"MasterPlayerAccountId": "..."}}}
+      - Raw string body: "SomeName"
+      - Query string: ?name=...&forRoom=true&forTroop=false
+      - Form body: name=...&forRoom=true
+    """
+    name = ''
+    for_room = False
+    for_troop = False
+    playfabid = ''
+
+    body = request.get_json(silent=True)
+
+    if isinstance(body, dict):
+        params = body.get('FunctionParameter')
+        if params is None:
+            params = body.get('FunctionArgument')
+        if params is None:
+            params = body
+
+        if isinstance(params, str):
+            parsed = safe_json_loads(params)
+            params = parsed if isinstance(parsed, dict) else {'name': params}
+
+        if isinstance(params, dict):
+            name = str(params.get('name') or params.get('Name') or '')
+            for_room = str(params.get('forRoom', params.get('ForRoom', 'False'))).lower() == 'true'
+            for_troop = str(params.get('forTroop', params.get('ForTroop', 'False'))).lower() == 'true'
+
+        # FIX: resolve the caller id through the shared helper so the standard
+        # PlayFab envelope shapes (Entity.Id, CallerEntityProfile.Lineage,
+        # PlayFabTicket, FunctionParameter.PlayFabId, body.PlayFabId) all work.
+        playfabid = get_playfabid_from_request(body) or ''
+        if not playfabid:
+            st = body.get('SessionTicket') or body.get('PlayFabTicket') or ''
+            playfabid = playfab_pfid_from_session_ticket(st) or ''
+
+    elif isinstance(body, str) and body:
+        name = body
+
+    if not name:
+        name = (request.args.get('name')
+                or request.args.get('Name')
+                or request.form.get('name')
+                or request.form.get('Name')
+                or '')
+    if not for_room:
+        for_room = str(request.args.get('forRoom', request.form.get('forRoom', 'False'))).lower() == 'true'
+    if not for_troop:
+        for_troop = str(request.args.get('forTroop', request.form.get('forTroop', 'False'))).lower() == 'true'
+    if not playfabid:
+        playfabid = (request.args.get('PlayFabId')
+                     or request.args.get('playfabid')
+                     or '')
+
+    return name, for_room, for_troop, playfabid
+
+
+@app.route('/api/CheckForBadName', methods=['GET', 'POST'])
+def api_check_for_bad_name_standalone():
+    """Plain-shape name filter endpoint.
+
+    Returns {"result": 0} for OK, {"result": 2, "reason": "..."} for blocked.
+    Persists the display name locally (+ PlayFab) when it's a player name
+    (forRoom=False and forTroop=False) and a playfabid is present.
+    """
+    try:
+        name, for_room, for_troop, playfabid = _extract_bad_name_params()
+
+        result, reason = name_check_result(name)
+
+        if result == 0 and not for_room and not for_troop and playfabid and name:
+            if CONFIG['playfab_secret_key']:
+                try:
+                    pf = playfab_update_display_name(playfabid, name)
+                    print(f"[CheckForBadName] PlayFab update: "
+                          f"playfabid={playfabid!r} name={name!r} "
+                          f"status={pf.get('status')} data={pf.get('data')}")
+                except Exception as e:
+                    print(f"[CheckForBadName] PlayFab update raised: {e}")
+            else:
+                print(f"[CheckForBadName] PlayFab not configured, name NOT saved: "
+                      f"playfabid={playfabid!r} name={name!r}")
+
+        out = {'result': result}
+        if reason:
+            out['reason'] = reason
+        return jsonify(out)
+
+    except Exception as e:
+        print(f"[CheckForBadName error] {e}")
+        return jsonify({'result': 0})
 
 # ============================================================================
 # Routes - Mothership v1 API
@@ -2821,38 +2916,147 @@ def ping_room():
         return 'Error', 500
 
 # ============================================================================
-# Routes - daily/weekly quests (points ledger, official key formats)
+# Routes - MonkeBiz daily/weekly quests (points ledger)
+#
+# Client contract (ref game files 25/ProgressionController.cs):
+#   POST /api/GetQuestStatus   {PlayFabId, PlayFabTicket, MothershipId, MothershipToken}
+#   POST /api/SetQuestComplete {..., QuestId, ClientVersion}
+#   -> {"result":{"dailyPoints":{"MM/DD/YYYY":int},"weeklyPoints":{isoweek:int},
+#                 "userPointsTotal":int},"statusCode":200,"error":null}
+# The client awards only the INCREASE of userPointsTotal, its weekly progress is
+# min(sum(dailyPoints)+sum(weeklyPoints), 25) and a 403 makes it drop its queued
+# completions. So: prune stale keys, mirror the cap, and never answer with a
+# plain 4xx (that permanently jams the client's completion queue).
 # ============================================================================
 
-QUEST_WEEKLY_POINT_CAP = 25
+QUEST_WEEKLY_POINT_CAP = 25       # ProgressionController.WeeklyCap
+QUEST_DAILY_POINT_VALUE = 1       # daily quest reward
+QUEST_WEEKLY_POINT_VALUE = 5      # weekly quest reward (official ledger {"41": 5})
+
+_pf_quest_sets_cache = {'daily': None, 'weekly': None, 'ts': 0.0}
+_PF_QUEST_SETS_TTL = 300.0
+
+
+def _quest_set_ids():
+    """(daily_ids, weekly_ids) parsed from title-data AllActiveQuests.
+
+    The quest board itself is served by PlayFab title data; membership decides
+    whether a completion pays 1 (daily) or 5 (weekly) points.
+    """
+    now = time.time()
+    if (_pf_quest_sets_cache['daily'] is not None
+            and now - _pf_quest_sets_cache['ts'] < _PF_QUEST_SETS_TTL):
+        return _pf_quest_sets_cache['daily'], _pf_quest_sets_cache['weekly']
+    daily, weekly = set(), set()
+    try:
+        raw = get_title_data().get('AllActiveQuests')
+        data = safe_json_loads(raw, {}) if isinstance(raw, str) else (raw or {})
+        for section, bucket in (('DailyQuests', daily), ('WeeklyQuests', weekly)):
+            for group in (data or {}).get(section, []) or []:
+                for quest in (group or {}).get('quests', []) or []:
+                    qid = quest.get('questID') if isinstance(quest, dict) else None
+                    if qid is not None:
+                        bucket.add(int(qid))
+    except Exception as e:
+        print(f"[quests] AllActiveQuests parse failed: {e}")
+    _pf_quest_sets_cache.update({'daily': daily, 'weekly': weekly, 'ts': now})
+    return daily, weekly
+
+
+def _quest_points_for(questid):
+    """Official split: daily quest = 1 point, weekly quest = 5 points.
+    Unknown ids (title data unavailable) count as daily."""
+    try:
+        qid = int(questid)
+    except (TypeError, ValueError):
+        return 'daily', QUEST_DAILY_POINT_VALUE, None
+    _daily_ids, weekly_ids = _quest_set_ids()
+    if qid in weekly_ids:
+        return 'weekly', QUEST_WEEKLY_POINT_VALUE, qid
+    return 'daily', QUEST_DAILY_POINT_VALUE, qid
+
+
+def quest_player_id(body):
+    """Resolve the quest-ledger owner without ever failing the client.
+    PlayFabId -> MothershipId/token subject -> PlayFabTicket prefix."""
+    playfabid = str(body.get('PlayFabId') or body.get('PlayFabID') or '').strip()
+    if not playfabid:
+        playfabid = str(body.get('MothershipId') or '').strip()
+    if not playfabid:
+        mothershipid, _err = si_request_identity(body, require_token=False)
+        playfabid = str(mothershipid or '').strip()
+    if not playfabid:
+        playfabid = playfab_pfid_from_session_ticket(body.get('PlayFabTicket') or '')
+    return playfabid
+
+
+def _prune_quest_points(daily, weekly, now=None):
+    """Keep only the current week. The client sums every key it receives and
+    clamps at 25, so leftover history would pin its progress at the cap (and
+    our own cap check would answer 403) for the rest of time."""
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    monday = today - timedelta(days=today.weekday())
+    pruned_daily = {}
+    for key, value in (daily or {}).items():
+        try:
+            day = datetime.strptime(str(key), '%m/%d/%Y').date()
+        except Exception:
+            continue
+        if monday <= day <= today:
+            pruned_daily[str(key)] = int(value or 0)
+    week = week_number_key(now)
+    pruned_weekly = {str(k): int(v or 0) for k, v in (weekly or {}).items()
+                     if str(k) == week}
+    return pruned_daily, pruned_weekly
+
 
 def _quest_row(playfabid):
+    """Read the ledger row; a missing row is an empty in-memory default (no
+    write on reads - only SetQuestComplete persists)."""
     row = db_get_one('queststatus', {'playfabid': playfabid})
-    if not row:
-        db_insert('queststatus', {'playfabid': playfabid,
-                                  'dailypoints': '{}', 'weeklypoints': '{}',
-                                  'userpointstotal': 0})
-        row = db_get_one('queststatus', {'playfabid': playfabid})
-    return row or {'dailypoints': '{}', 'weeklypoints': '{}', 'userpointstotal': 0}
+    return row or {'playfabid': playfabid, 'dailypoints': '{}',
+                   'weeklypoints': '{}', 'userpointstotal': 0}
 
 
-def _quest_payload(row):
+def _quest_payload(row, daily=None, weekly=None):
+    if daily is None:
+        daily = safe_json_loads(row.get('dailypoints'), {}) or {}
+    if weekly is None:
+        weekly = safe_json_loads(row.get('weeklypoints'), {}) or {}
     return {
-        'dailyPoints': safe_json_loads(row.get('dailypoints'), {}) or {},
-        'weeklyPoints': safe_json_loads(row.get('weeklypoints'), {}) or {},
+        'dailyPoints': daily,
+        'weeklyPoints': weekly,
         'userPointsTotal': int(row.get('userpointstotal', 0) or 0),
     }
+
+
+def _save_quest_row(playfabid, daily, weekly, total):
+    """Atomic whole-row write (upsert) so a completion can never half-apply."""
+    return db_upsert('queststatus', {
+        'playfabid': playfabid,
+        'dailypoints': json.dumps(daily),
+        'weeklypoints': json.dumps(weekly),
+        'userpointstotal': int(total),
+        'updatedat': utc_now_iso(),
+    }, ['playfabid'])
 
 
 @app.route('/api/GetQuestStatus', methods=['GET', 'POST'])
 def get_quest_status():
     try:
         body = request.get_json(silent=True) or {}
-        playfabid = body.get('PlayFabId', '')
+        playfabid = quest_player_id(body)
         if not playfabid:
-            return jsonify({'result': None, 'statusCode': 400,
-                            'error': 'Missing PlayFabId'}), 400
-        return jsonify({'result': _quest_payload(_quest_row(playfabid)),
+            print(f"[quest status] unresolved player id: {str(body)[:220]}")
+            return jsonify({'result': {'dailyPoints': {}, 'weeklyPoints': {},
+                                       'userPointsTotal': 0},
+                            'statusCode': 200, 'error': None})
+        row = _quest_row(playfabid)
+        daily, weekly = _prune_quest_points(
+            safe_json_loads(row.get('dailypoints'), {}) or {},
+            safe_json_loads(row.get('weeklypoints'), {}) or {})
+        return jsonify({'result': _quest_payload(row, daily, weekly),
                         'statusCode': 200, 'error': None})
     except Exception as e:
         print(f"[quest status error] {e}")
@@ -2863,33 +3067,40 @@ def get_quest_status():
 def set_quest_complete():
     try:
         body = request.get_json(silent=True) or {}
-        playfabid = body.get('PlayFabId', '')
-        questid = body.get('QuestId', body.get('QuestID'))
-        if not playfabid or questid is None:
-            return jsonify({'result': None, 'statusCode': 400,
-                            'error': 'Missing fields'}), 400
+        playfabid = quest_player_id(body)
+        questid = body.get('QuestId', body.get('QuestID', body.get('questId')))
+        kind, points, qid = _quest_points_for(questid)
+
+        if not playfabid:
+            print(f"[quest complete] unresolved player id: {str(body)[:220]}")
+            return jsonify({'result': {'dailyPoints': {}, 'weeklyPoints': {},
+                                       'userPointsTotal': 0},
+                            'statusCode': 200, 'error': None})
 
         row = _quest_row(playfabid)
-        daily = safe_json_loads(row.get('dailypoints'), {}) or {}
-        weekly = safe_json_loads(row.get('weeklypoints'), {}) or {}
+        daily, weekly = _prune_quest_points(
+            safe_json_loads(row.get('dailypoints'), {}) or {},
+            safe_json_loads(row.get('weeklypoints'), {}) or {})
         total = int(row.get('userpointstotal', 0) or 0)
 
-        if sum(weekly.values()) >= QUEST_WEEKLY_POINT_CAP:
+        weekly_progress = sum(daily.values()) + sum(weekly.values())
+        if weekly_progress >= QUEST_WEEKLY_POINT_CAP:
+            print(f"[quest complete] playfab={playfabid} weekly cap reached "
+                  f"({weekly_progress}/{QUEST_WEEKLY_POINT_CAP})")
             return jsonify({'result': None, 'statusCode': 403,
                             'error': 'Weekly cap reached'}), 403
 
-        today = date_key()
-        week = week_number_key()
-        daily[today] = int(daily.get(today, 0)) + 1
-        weekly[week] = int(weekly.get(week, 0)) + 10
-        total += 1
+        if kind == 'weekly':
+            week = week_number_key()
+            weekly[week] = int(weekly.get(week, 0)) + points
+        else:
+            today = date_key()
+            daily[today] = int(daily.get(today, 0)) + points
+        total += points
 
-        db_update('queststatus', {'playfabid': playfabid}, {
-            'dailypoints': json.dumps(daily),
-            'weeklypoints': json.dumps(weekly),
-            'userpointstotal': total,
-            'updatedat': utc_now_iso(),
-        })
+        _save_quest_row(playfabid, daily, weekly, total)
+        print(f"[quest complete] playfab={playfabid} quest={qid} kind={kind} "
+              f"+{points} total={total}")
         return jsonify({'result': {'dailyPoints': daily, 'weeklyPoints': weekly,
                                    'userPointsTotal': total},
                         'statusCode': 200, 'error': None})
@@ -2968,7 +3179,8 @@ def get_si_quests_status():
 @app.route('/api/SetSIQuestComplete', methods=['GET', 'POST'])
 def set_si_quest_complete():
     """Official captured flow: quests 9->8->7, idol untouched, every 4th
-    completion banks a bonus point."""
+    completion banks a bonus point, and every claim pays 1 TechPoint (official
+    inventory delta 8->9->10 around the captured SetSIQuestComplete calls)."""
     try:
         body = request.get_json(silent=True) or {}
         mothershipid, err = si_request_identity(body, require_token=(request.method == 'POST'))
@@ -2978,9 +3190,6 @@ def set_si_quest_complete():
             return jsonify({'result': None, 'statusCode': 400,
                             'error': 'Missing MothershipId'}), 400
         quest_id = body.get('QuestID', body.get('QuestId'))
-        if quest_id is None:
-            return jsonify({'result': None, 'statusCode': 400,
-                            'error': 'Missing QuestID'}), 400
 
         si_ensure_player_exists(mothershipid)
         status = si_roll_daily_reset(mothershipid)
@@ -2998,6 +3207,21 @@ def set_si_quest_complete():
             'stashed_bonus_points': new_stashed_bonus,
             'updated_at': utc_now_iso(),
         })
+
+        # Every accepted quest claim pays one TechPoint - this is what the
+        # game's SI reward machine banks. Read-modify-write with retries.
+        updated = None
+        for _attempt in range(3):
+            current = si_get_inventory(mothershipid)
+            si_update_resources(mothershipid,
+                                {'tech_points': int(current.get('TechPoints', 0)) + 1})
+            updated = si_get_inventory(mothershipid)
+            if int(updated.get('TechPoints', 0)) >= int(current.get('TechPoints', 0)) + 1:
+                break
+
+        print(f"[SI claim] mothership={mothershipid} quest={quest_id} "
+              f"claimable={new_stashed} bonus={new_stashed_bonus} "
+              f"techPoints={int((updated or {}).get('TechPoints', 0))}")
         return jsonify(si_quest_status_response(si_get_quest_status(mothershipid)))
     except Exception as e:
         print(f"[SetSIQuestComplete error] {e}")
@@ -3026,7 +3250,7 @@ def set_si_idol_collect():
 
 @app.route('/api/ResetSIQuestsStatus', methods=['POST'])
 def reset_si_quests_status():
-    """Admin/debug helper: reset claimables to a fresh day (3/1/1)."""
+    """Admin/debug helper: reset claimables to a fresh day (9/3/1)."""
     try:
         body = request.get_json(silent=True) or {}
         mothershipid = body.get('MothershipId', '')
@@ -3035,13 +3259,15 @@ def reset_si_quests_status():
                             'error': 'Missing MothershipId'}), 400
         si_ensure_player_exists(mothershipid)
         db_update('si_player_quest_status', {'mothershipid': mothershipid}, {
-            'stashed_quests': 3, 'stashed_bonus_points': 1, 'bonus_progress': 0,
+            'stashed_quests': SI_DAILY_CLAIMABLE_QUESTS,
+            'stashed_bonus_points': SI_DAILY_CLAIMABLE_BONUS, 'bonus_progress': 0,
             'daily_limited_turned_in': False,
             'last_reset_date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
             'updated_at': utc_now_iso(),
         })
         return jsonify(si_quest_status_response({
-            'stashed_quests': 3, 'stashed_bonus_points': 1,
+            'stashed_quests': SI_DAILY_CLAIMABLE_QUESTS,
+            'stashed_bonus_points': SI_DAILY_CLAIMABLE_BONUS,
             'daily_limited_turned_in': False,
         }))
     except Exception as e:
@@ -3520,24 +3746,64 @@ def set_ghost_reactor_inventory():
         return 'Error', 500
 
 # ============================================================================
-# Routes - shared maps (Monke Blocks / Destinations)
+# Routes - shared maps / Monke Blocks (Virtual Stump / Destinations)
+#
+# Client contract (ref game files 25/GorillaTagScripts.Builder/
+# SharedBlocksManager.cs): Publish/GetMaps/GetMapData/MapVote/UpdateMapActive.
+# Every call carries mothershipId + mothershipToken in the body; when the id is
+# empty we fall back to the token so an auth quirk cannot turn a working call
+# into a 400. Publish returns a plain 8-char map id from the official alphabet
+# (^[CFGHKMNPRTWXZ256789]{8}$ - the client validates the pattern itself).
 # ============================================================================
+
+def map_request_identity(body):
+    """Resolve the Monke Blocks caller: body mothershipId, else the Mothership
+    token from the body, else the x-mothership-token header."""
+    mothershipid = str(body.get('mothershipId') or body.get('MothershipId') or '').strip()
+    if mothershipid:
+        return mothershipid
+    token = body.get('mothershipToken') or body.get('MothershipToken') or ''
+    decoded = verify_token(token) if token else None
+    if not decoded:
+        decoded = verify_token(request.headers.get('x-mothership-token', ''))
+    return str((decoded or {}).get('sub', '') or '').strip()
+
+
+def db_insert_strict(table, data):
+    """Insert and report real success. db_insert() swallows errors, which
+    would let /api/Publish answer 'success' for a map that was never stored."""
+    if not supabase:
+        return False
+    try:
+        supabase.table(table).insert(data).execute()
+        return True
+    except Exception as e:
+        print(f"[db_insert_strict error] {table}: {e}")
+        return False
+
 
 @app.route('/api/Publish', methods=['POST'])
 def publish_map():
     try:
         body = request.get_json(silent=True) or {}
-        mothershipid = body.get('mothershipId', body.get('MothershipId', ''))
-        metadatakey = body.get('userdataMetadataKey', '')
-        nickname = body.get('playerNickname', '')
+        mothershipid = map_request_identity(body)
+        metadatakey = str(body.get('userdataMetadataKey')
+                          or body.get('userDataMetadataKey') or '').strip()
+        nickname = str(body.get('playerNickname') or body.get('PlayerNickname') or '')
         if not mothershipid or not metadatakey:
+            print(f"[publish map] missing fields id={bool(mothershipid)} "
+                  f"key={metadatakey!r} body={str(body)[:220]}")
             return 'Missing fields', 400
 
         mapid = generate_map_id()
         ud = db_get_one('mothershipuserdata',
                         {'mothershipid': mothershipid, 'keyname': metadatakey})
         mapdata = (ud or {}).get('datavalue', '')
-        db_insert('sharedmaps', {
+        if not mapdata:
+            print(f"[publish map] no userdata row {mothershipid}/{metadatakey} - "
+                  f"publishing empty map data")
+
+        inserted = db_insert_strict('sharedmaps', {
             'mapid': mapid,
             'mothershipid': mothershipid,
             'userdatametadatakey': metadatakey,
@@ -3545,6 +3811,11 @@ def publish_map():
             'mapdata': mapdata,
             'isactive': 1,
         })
+        if not inserted:
+            print(f"[publish map] sharedmaps insert failed for {mapid} - not reporting success")
+            return 'Error', 500
+        print(f"[publish map] id={mapid} key={metadatakey} nickname={nickname!r} "
+              f"bytes={len(mapdata)}")
         return mapid, 200
     except Exception as e:
         print(f"[publish map error] {e}")
@@ -3553,12 +3824,17 @@ def publish_map():
 
 @app.route('/api/GetMapData', methods=['POST'])
 def get_map_data():
+    """Returns the stored map payload verbatim - the official server hands the
+    client the same base64/gzip blob it uploaded to Mothership user data."""
     try:
         body = request.get_json(silent=True) or {}
-        mapid = body.get('mapId', body.get('MapId', ''))
+        mapid = str(body.get('mapId') or body.get('MapId') or '').strip()
         if not mapid:
             return '', 400
         row = db_get_one('sharedmaps', {'mapid': mapid}, 'mapdata')
+        if not row:
+            print(f"[get map data] unknown map id {mapid}")
+            return '', 404
         return (row or {}).get('mapdata', ''), 200
     except Exception as e:
         print(f"[get map error] {e}")
@@ -3568,15 +3844,21 @@ def get_map_data():
 @app.route('/api/GetMaps', methods=['POST'])
 def get_maps():
     """Official captured shape: [{mapId, nickname, createdTime, updatedTime,
-    voteCount, isActive}]"""
+    voteCount, isActive}]. sort carries the client's MapSortMethod name:
+    'Top' | 'NewlyCreated' | 'RecentlyUpdated'."""
     try:
         body = request.get_json(silent=True) or {}
-        page = int(body.get('page', 0) or 0)
-        pagesize = min(int(body.get('pageSize', 20) or 20), 100)
-        sort = body.get('sort', 'recent')
-        show_inactive = body.get('ShowInactive', False)
+        page = max(0, int(body.get('page', 0) or 0))
+        pagesize = min(max(1, int(body.get('pageSize', 20) or 20)), 100)
+        sort = str(body.get('sort', 'Top') or 'Top')
+        show_inactive = bool(body.get('ShowInactive', False))
 
-        order_col = 'votecount' if sort == 'Top' else 'createdat'
+        order_col = 'createdat'
+        if sort == 'Top':
+            order_col = 'votecount'
+        elif sort == 'RecentlyUpdated':
+            order_col = 'updatedat'
+
         rows = db_get('sharedmaps',
                       None if show_inactive else {'isactive': 1},
                       order_by=(order_col, True))
@@ -3587,10 +3869,10 @@ def get_maps():
         maps = [{
             'mapId': row.get('mapid'),
             'nickname': row.get('nickname'),
-            'createdTime': row.get('createdat'),
-            'updatedTime': row.get('updatedat'),
-            'voteCount': row.get('votecount', 0),
-            'isActive': row.get('isactive') == 1,
+            'createdTime': row.get('createdat') or '',
+            'updatedTime': row.get('updatedat') or '',
+            'voteCount': int(row.get('votecount', 0) or 0),
+            'isActive': bool(row.get('isactive', 0)),
         } for row in page_rows]
         return jsonify(maps)
     except Exception as e:
@@ -3600,63 +3882,213 @@ def get_maps():
 
 @app.route('/api/MapVote', methods=['POST'])
 def map_vote():
-    """Official captured response: {'voteCount': N, 'statusCode': 201, 'error': None}"""
+    """Official captured response: {'voteCount': N, 'statusCode': 201, 'error': None}
+    vote is +1 / -1; re-voting replaces that player's previous value."""
     try:
         body = request.get_json(silent=True) or {}
-        mothershipid = body.get('mothershipId', body.get('MothershipId', ''))
-        mapid = body.get('mapId', body.get('MapId', ''))
-        vote = int(body.get('vote', 0) or 0)
+        mothershipid = map_request_identity(body)
+        mapid = str(body.get('mapId') or body.get('MapId') or '').strip()
+        try:
+            vote = int(body.get('vote', 0) or 0)
+        except (TypeError, ValueError):
+            vote = 0
+        vote = max(-1, min(1, vote))
         if not mothershipid or not mapid:
+            print(f"[map vote] missing fields id={bool(mothershipid)} map={mapid!r}")
             return 'Missing fields', 400
 
         db_upsert('mapvotes', {'mapid': mapid, 'mothershipid': mothershipid,
                                'vote': vote}, ['mapid', 'mothershipid'])
-        total = sum(v.get('vote', 0) for v in db_get('mapvotes', {'mapid': mapid}))
+        total = sum(int(v.get('vote', 0) or 0)
+                    for v in db_get('mapvotes', {'mapid': mapid}))
         db_update('sharedmaps', {'mapid': mapid}, {'votecount': total})
+        print(f"[map vote] mothership={mothershipid} map={mapid} vote={vote} total={total}")
         return jsonify({'voteCount': total, 'statusCode': 201, 'error': None}), 201
     except Exception as e:
         print(f"[map vote error] {e}")
         return 'Error', 500
 
+
+@app.route('/api/UpdateMapActive', methods=['POST'])
+def update_map_active():
+    """Called by SharedBlocksManager when a save slot's published map is
+    (de)activated. Body: {mothershipId, mothershipToken, userdataMetadataKey,
+    setActive}; the client only checks for a 2xx response."""
+    try:
+        body = request.get_json(silent=True) or {}
+        mothershipid = map_request_identity(body)
+        metadatakey = str(body.get('userdataMetadataKey')
+                          or body.get('userDataMetadataKey') or '').strip()
+        set_active = bool(body.get('setActive', body.get('SetActive', False)))
+        if not mothershipid or not metadatakey:
+            print(f"[update map active] missing fields id={bool(mothershipid)} "
+                  f"key={metadatakey!r}")
+            return 'Missing fields', 400
+
+        rows = db_get('sharedmaps', {'mothershipid': mothershipid,
+                                     'userdatametadatakey': metadatakey})
+        for row in rows:
+            db_update('sharedmaps', {'mapid': row.get('mapid')},
+                      {'isactive': 1 if set_active else 0,
+                       'updatedat': utc_now_iso()})
+        print(f"[update map active] mothership={mothershipid} key={metadatakey} "
+              f"active={set_active} maps={len(rows)}")
+        return 'OK', 200
+    except Exception as e:
+        print(f"[update map active error] {e}")
+        return 'Error', 500
+
 # ============================================================================
-# Routes - polls
+# Routes - Monke Vote polls
+#
+# Poll definitions come from api/data/Every Poll Question.json (the official
+# FetchPoll dump shape, pollId 20+); Supabase poll_votes stores what players on
+# THIS server voted. Client contract (MonkeVoteController.cs):
+#   POST /api/FetchPoll {TitleId, PlayFabId, PlayFabTicket, IncludeInactive}
+#        -> JSON ARRAY of {pollId, question, voteOptions, voteCount,
+#                          predictionCount, startTime, endTime, isActive}
+#   POST /api/Vote {PollId, TitleId, PlayFabId, OculusId, UserNonce,
+#                   UserPlatform, OptionIndex, IsPrediction, PlayFabTicket}
+#        -> {pollId, titleId, voteOptions, voteCount, predictionCount}
+# The client hides results while a poll is RUNNING (official returns empty
+# count arrays then) and shows the previous poll's counts, and it expects a 429
+# for a duplicate vote ("User already voted on this poll!"). A vote and a
+# prediction are independent rows: the client's own state machine requires the
+# vote first, but the official server accepts a prediction on its own (the
+# captured Vote request was IsPrediction=true with no prior vote in the dump), so
+# we do too.
 # ============================================================================
+
+POLL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'data', 'Every Poll Question.json')
+_poll_file_cache = {'polls': None, 'ts': 0.0, 'mtime': None}
+_POLL_FILE_TTL = 60.0
+
+
+def _load_poll_file():
+    """Poll definitions from data/Every Poll Question.json.
+
+    The file has been seen both as plain JSON and as a double-escaped JSON
+    string (every quote stored as \\"), so parse plain first and fall back to
+    decoding it as an escaped string.
+    """
+    try:
+        mtime = os.path.getmtime(POLL_FILE)
+    except OSError as e:
+        print(f"[polls] cannot stat {POLL_FILE}: {e}")
+        return []
+    now = time.time()
+    if (_poll_file_cache['polls'] is not None
+            and _poll_file_cache['mtime'] == mtime
+            and now - _poll_file_cache['ts'] < _POLL_FILE_TTL):
+        return _poll_file_cache['polls']
+
+    polls = []
+    try:
+        with open(POLL_FILE, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        try:
+            polls = json.loads(raw)
+        except Exception:
+            polls = json.loads(json.loads('"' + raw.strip() + '"'))
+        if not isinstance(polls, list):
+            polls = []
+    except Exception as e:
+        print(f"[polls] failed to load {POLL_FILE}: {e}")
+        polls = []
+
+    if polls:
+        print(f"[polls] loaded {len(polls)} polls from file")
+    _poll_file_cache.update({'polls': polls, 'ts': now, 'mtime': mtime})
+    return polls
+
+
+def _poll_definition(poll_id):
+    for poll in _load_poll_file():
+        try:
+            if int(poll.get('pollId')) == int(poll_id):
+                return poll
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _poll_vote_counts(poll_id, option_count=2):
+    """This server's votes/predictions for one poll (Supabase overlay)."""
+    votes = [0] * option_count
+    preds = [0] * option_count
+    for row in db_get('poll_votes', {'poll_id': poll_id}):
+        try:
+            idx = int(row.get('option_index', -1))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < option_count:
+            if row.get('is_prediction'):
+                preds[idx] += 1
+            else:
+                votes[idx] += 1
+    return votes, preds
+
+
+def _vote_payload(poll, title_id=None):
+    """Official VoteResponse: exactly the five captured keys - the client's
+    VoteResponse class has no board fields (question/times/isActive)."""
+    full = _poll_payload(poll, include_counts=not bool(poll.get('isActive')),
+                         with_title=True, title_id=title_id)
+    return {k: full[k] for k in ('pollId', 'titleId', 'voteOptions',
+                                 'voteCount', 'predictionCount')}
+
+
+def _poll_payload(poll, include_counts=True, with_title=False, title_id=None):
+    """Official poll object; base counts from the file + our own votes."""
+    options = list(poll.get('voteOptions') or [])
+    vote_counts, pred_counts = _poll_vote_counts(poll.get('pollId'),
+                                                max(2, len(options)))
+    base_votes = list(poll.get('voteCount') or [])
+    base_preds = list(poll.get('predictionCount') or [])
+    out_votes = []
+    out_preds = []
+    for i in range(len(options)):
+        base_v = int(base_votes[i]) if i < len(base_votes) and base_votes[i] is not None else 0
+        base_p = int(base_preds[i]) if i < len(base_preds) and base_preds[i] is not None else 0
+        out_votes.append(base_v + vote_counts[i])
+        out_preds.append(base_p + pred_counts[i])
+    payload = {
+        'pollId': int(poll.get('pollId') or 0),
+        'question': poll.get('question', ''),
+        'voteOptions': options,
+        'voteCount': out_votes if include_counts else [],
+        'predictionCount': out_preds if include_counts else [],
+        'startTime': poll.get('startTime') or '',
+        'endTime': poll.get('endTime') or '',
+        'isActive': bool(poll.get('isActive')),
+    }
+    if with_title:
+        # official VoteResponse echoes the request's TitleId (captured: '63FDD')
+        payload['titleId'] = title_id or CONFIG['playfab_title_id']
+    return payload
+
 
 @app.route('/api/FetchPoll', methods=['GET', 'POST'])
 def fetch_poll():
     try:
         body = request.get_json(silent=True) or {}
-        include_inactive = body.get('IncludeInactive', True)
-        now_iso = utc_now_iso()
-        polls = db_get('polls', order_by=('created_at', True), limit=25)
-
+        include_inactive = bool(body.get('IncludeInactive', True))
+        polls = sorted(_load_poll_file(),
+                       key=lambda p: int(p.get('pollId') or 0))
         results = []
-        for row in polls:
-            options = safe_json_loads(row.get('options_json'), []) or []
-            end_time = row.get('expires_at')
-            is_active = (not end_time) or end_time > now_iso
+        active_seen = False
+        for poll in polls:
+            is_active = bool(poll.get('isActive'))
+            if is_active:
+                active_seen = True
             if not include_inactive and not is_active:
                 continue
-
-            vote_counts = []
-            pred_counts = []
-            for i in range(len(options)):
-                vote_counts.append(db_count('poll_votes', {
-                    'poll_id': row['id'], 'option_index': i, 'is_prediction': 0}))
-                pred_counts.append(db_count('poll_votes', {
-                    'poll_id': row['id'], 'option_index': i, 'is_prediction': 1}))
-
-            results.append({
-                'pollId': row['id'],
-                'question': row.get('question', ''),
-                'voteOptions': options,
-                'voteCount': vote_counts if not is_active else [],
-                'predictionCount': pred_counts if not is_active else [],
-                'startTime': row.get('created_at'),
-                'endTime': end_time or (datetime.now(timezone.utc)
-                                        + timedelta(days=365)).isoformat(),
-                'isActive': is_active,
-            })
+            # results stay hidden while a poll is running (official shape)
+            results.append(_poll_payload(poll, include_counts=not is_active))
+        if not active_seen:
+            print("[polls] warning: no active poll in Every Poll Question.json - "
+                  "add/advance the newest poll so the vote machine works")
         return jsonify(results)
     except Exception as e:
         print(f"[fetch poll error] {e}")
@@ -3667,49 +4099,57 @@ def fetch_poll():
 def vote():
     try:
         body = request.get_json(silent=True) or {}
-        raw_poll = body.get('PollId')
-        raw_option = body.get('OptionIndex')
-        playfabid = body.get('PlayFabId', '')
+        playfabid = str(body.get('PlayFabId') or '').strip() or quest_player_id(body)
         is_prediction = bool(body.get('IsPrediction', False))
         try:
-            poll_id = int(raw_poll)
+            poll_id = int(body.get('PollId'))
         except (TypeError, ValueError):
             poll_id = 0
         try:
-            option_index = int(raw_option)
+            option_index = int(body.get('OptionIndex'))
         except (TypeError, ValueError):
             option_index = -1
 
-        if not poll_id or not playfabid or option_index < 0:
+        if not playfabid or not poll_id or option_index < 0:
+            print(f"[poll vote] missing fields: {str(body)[:220]}")
             return jsonify({'error': 'Missing fields'}), 400
 
-        poll = db_get_one('polls', {'id': poll_id})
+        poll = _poll_definition(poll_id)
         if not poll:
+            print(f"[poll vote] unknown poll {poll_id}")
             return jsonify({'error': 'Poll not found'}), 404
-
-        options = safe_json_loads(poll.get('options_json'), []) or []
+        options = list(poll.get('voteOptions') or [])
         if option_index >= len(options):
             return jsonify({'error': 'Invalid option'}), 400
 
-        if is_prediction:
-            has_vote = db_get_one('poll_votes', {'poll_id': poll_id,
-                                                 'playfabid': playfabid,
-                                                 'is_prediction': 0})
-            if not has_vote:
-                return jsonify({'error': 'Must vote first'}), 400
-        else:
-            existing = db_get_one('poll_votes', {'poll_id': poll_id,
-                                                 'playfabid': playfabid,
-                                                 'is_prediction': 0})
-            if existing:
-                return jsonify({'error': 'Already voted'}), 400
+        # Mirror the definition into Supabase so poll_votes' FK to polls holds.
+        db_upsert('polls', {
+            'id': poll_id,
+            'question': poll.get('question', ''),
+            'options_json': json.dumps(options),
+            'created_at': poll.get('startTime') or utc_now_iso(),
+            'expires_at': poll.get('endTime') or None,
+        }, ['id'])
+
+        existing = db_get_one('poll_votes', {
+            'poll_id': poll_id, 'playfabid': playfabid,
+            'is_prediction': 1 if is_prediction else 0})
+        if existing:
+            # official answers 429 - the client treats it as "already voted"
+            print(f"[poll vote] duplicate playfab={playfabid} poll={poll_id} "
+                  f"prediction={is_prediction}")
+            return jsonify({'error': 'Already voted'}), 429
 
         db_insert('poll_votes', {
             'poll_id': poll_id, 'playfabid': playfabid,
-            'option_index': option_index, 'is_prediction': 1 if is_prediction else 0,
+            'option_index': option_index,
+            'is_prediction': 1 if is_prediction else 0,
             'created_at': utc_now_iso(),
         })
-        return jsonify({'success': True})
+        print(f"[poll vote] playfab={playfabid} poll={poll_id} "
+              f"option={option_index} prediction={is_prediction}")
+        return jsonify(_vote_payload(poll,
+                                     title_id=str(body.get('TitleId') or '').strip()))
     except Exception as e:
         print(f"[vote error] {e}")
         return jsonify({'error': 'Internal error'}), 500
