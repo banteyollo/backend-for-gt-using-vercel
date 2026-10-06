@@ -1,4 +1,6 @@
-﻿using BepInEx;
+//dont use it cuz i fixed checkforbadname endpoint so private rooms work also names too
+
+using BepInEx;
 using GorillaNetworking;
 using GorillaTagScripts;
 using HarmonyLib;
